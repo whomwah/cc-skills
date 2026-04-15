@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Generate release notes HTML and appcast item XML into build/appcast/.
+#
+# Required env:
+#   SPARKLE_EDDSA_KEY — EdDSA private key (base64) for signing the DMG
+#   APP_NAME          — app name (e.g. "Mark")
+#   RELEASES_REPO     — GitHub repo slug (e.g. "whomwah/mark-releases")
+#
+# Usage: bin/generate-appcast-item
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+APP_NAME="${APP_NAME:?APP_NAME must be set}"
+RELEASES_REPO="${RELEASES_REPO:?RELEASES_REPO must be set}"
+
+SIGN_UPDATE="build/derived/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
+
+[ -f "$SIGN_UPDATE" ] || { echo "ERROR: sign_update not found at $SIGN_UPDATE — run a build first"; exit 1; }
+[ -n "${SPARKLE_EDDSA_KEY:-}" ] || { echo "ERROR: SPARKLE_EDDSA_KEY not set"; exit 1; }
+
+version=$(grep '^\s*MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}' | tr -d '"')
+build=$(grep '^\s*CURRENT_PROJECT_VERSION:' project.yml | head -1 | awk '{print $2}' | tr -d '"')
+tag="v${version}"
+dmg_path="build/${APP_NAME}-${version}.dmg"
+
+[ -f "$dmg_path" ] || { echo "ERROR: DMG not found at ${dmg_path} — run 'just prepare-release' first"; exit 1; }
+
+mkdir -p build/appcast/notes
+"$SCRIPT_DIR/generate-release-notes" "$version" "$tag" build/appcast/notes
+
+dmg_size=$(stat -f%z "$dmg_path")
+ed_sig=$(echo "$SPARKLE_EDDSA_KEY" | "$SIGN_UPDATE" --ed-key-file - -p "$dmg_path")
+
+OWNER="$(echo "$RELEASES_REPO" | cut -d/ -f1)"
+REPO="$(echo "$RELEASES_REPO" | cut -d/ -f2)"
+download_url="https://github.com/${RELEASES_REPO}/releases/download/${tag}/${APP_NAME}-${version}.dmg"
+notes_url="https://${OWNER}.github.io/${REPO}/notes/${tag}.html"
+date_rfc=$(date -R 2>/dev/null || date "+%a, %d %b %Y %H:%M:%S %z")
+
+cat > build/appcast/item.xml << EOF
+        <item>
+            <title>Version ${version}</title>
+            <sparkle:releaseNotesLink>${notes_url}</sparkle:releaseNotesLink>
+            <pubDate>${date_rfc}</pubDate>
+            <sparkle:version>${build}</sparkle:version>
+            <sparkle:shortVersionString>${version}</sparkle:shortVersionString>
+            <enclosure url="${download_url}" type="application/octet-stream" length="${dmg_size}" sparkle:edSignature="${ed_sig}" />
+        </item>
+EOF
+
+echo "==> Generated: build/appcast/notes/${tag}.html"
+echo "==> Generated: build/appcast/item.xml"

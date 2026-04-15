@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Publish a release to a GitHub releases repo.
+#
+# Required env:
+#   APP_NAME      — app name (e.g. "Mark")
+#   RELEASES_REPO — GitHub repo slug (e.g. "whomwah/mark-releases")
+#
+# Expects release assets to already exist in build/ (created by just prepare-release + just release-notes).
+# Reads version from project.yml.
+#
+# What it does:
+#   1. Tags the local repo with v{VERSION} and pushes the tag
+#   2. Creates a GitHub Release in RELEASES_REPO with the DMG
+#   3. Updates appcast.xml and release notes on the gh-pages branch of RELEASES_REPO
+
+set -euo pipefail
+
+APP_NAME="${APP_NAME:?APP_NAME must be set}"
+RELEASES_REPO="${RELEASES_REPO:?RELEASES_REPO must be set}"
+
+# --- Read version from project.yml ---
+VERSION=$(grep '^\s*MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}' | tr -d '"')
+TAG="v${VERSION}"
+DMG_PATH="build/${APP_NAME}-${VERSION}.dmg"
+APPCAST_ITEM="build/appcast/item.xml"
+NOTES_HTML="build/appcast/notes/${TAG}.html"
+
+echo "==> Publishing ${APP_NAME} ${VERSION} (${TAG})"
+
+# --- Preflight ---
+echo "==> Preflight checks..."
+
+command -v gh &>/dev/null || { echo "ERROR: gh CLI not found — install from https://cli.github.com"; exit 1; }
+gh auth status &>/dev/null || { echo "ERROR: gh not authenticated — run 'gh auth login'"; exit 1; }
+
+[ -f "$DMG_PATH" ]      || { echo "ERROR: DMG not found at ${DMG_PATH} — run 'just prepare-release' first"; exit 1; }
+[ -f "$APPCAST_ITEM" ]   || { echo "ERROR: Appcast item not found at ${APPCAST_ITEM} — run 'just release-notes' first"; exit 1; }
+[ -f "$NOTES_HTML" ]     || { echo "ERROR: Release notes not found at ${NOTES_HTML} — run 'just release-notes' first"; exit 1; }
+
+echo "    DMG:           ${DMG_PATH}"
+echo "    Appcast item:  ${APPCAST_ITEM}"
+echo "    Release notes: ${NOTES_HTML}"
+
+# --- Tag ---
+echo "==> Tagging ${TAG}..."
+if git rev-parse "$TAG" &>/dev/null; then
+    echo "    Tag ${TAG} already exists locally"
+else
+    git tag "$TAG"
+    echo "    Created tag ${TAG}"
+fi
+
+if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+    echo "    Tag ${TAG} already exists on remote"
+else
+    git push origin "$TAG"
+    echo "    Pushed tag ${TAG}"
+fi
+
+# --- GitHub Release ---
+echo "==> Creating GitHub Release in ${RELEASES_REPO}..."
+if gh release view "$TAG" --repo "$RELEASES_REPO" &>/dev/null; then
+    echo "    Release ${TAG} already exists — uploading DMG asset"
+    gh release upload "$TAG" "$DMG_PATH" --repo "$RELEASES_REPO" --clobber
+else
+    gh release create "$TAG" \
+        --repo "$RELEASES_REPO" \
+        --title "${APP_NAME} ${VERSION}" \
+        --generate-notes \
+        "$DMG_PATH"
+    echo "    Created release ${APP_NAME} ${VERSION}"
+fi
+
+# --- Update appcast on gh-pages ---
+echo "==> Updating appcast on gh-pages..."
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+git clone \
+    --branch gh-pages \
+    --depth 1 \
+    "git@github.com:${RELEASES_REPO}.git" \
+    "$WORK_DIR" 2>/dev/null || {
+        git clone \
+            "git@github.com:${RELEASES_REPO}.git" \
+            "$WORK_DIR"
+        cd "$WORK_DIR"
+        git checkout --orphan gh-pages
+        git rm -rf . 2>/dev/null || true
+        cd -
+    }
+
+# Copy release notes HTML
+mkdir -p "$WORK_DIR/notes"
+cp "$NOTES_HTML" "$WORK_DIR/notes/${TAG}.html"
+echo "    Copied release notes to notes/${TAG}.html"
+
+# Update or create appcast.xml
+if [ -s "$WORK_DIR/appcast.xml" ]; then
+    python3 -c "
+content = open('$WORK_DIR/appcast.xml').read()
+if '${VERSION}' in content:
+    print('    Item for ${VERSION} already in appcast.xml — skipping')
+else:
+    item = open('$APPCAST_ITEM').read()
+    content = content.replace('</channel>', item + '\n    </channel>')
+    open('$WORK_DIR/appcast.xml', 'w').write(content)
+    print('    Appended item to existing appcast.xml')
+"
+else
+    cat > "$WORK_DIR/appcast.xml" << 'HEADER'
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+    <channel>
+        <title>${APP_NAME} Updates</title>
+HEADER
+    cat "$APPCAST_ITEM" >> "$WORK_DIR/appcast.xml"
+    cat >> "$WORK_DIR/appcast.xml" << 'FOOTER'
+    </channel>
+</rss>
+FOOTER
+    echo "    Created new appcast.xml"
+fi
+
+# Commit and push
+cd "$WORK_DIR"
+git config user.name "$(git config --global user.name)"
+git config user.email "$(git config --global user.email)"
+git add appcast.xml notes/
+git commit -m "Update appcast for ${TAG}" --allow-empty
+git push origin gh-pages
+cd -
+
+echo "==> Done! Release ${TAG} published to ${RELEASES_REPO}"
+echo "    Release:  https://github.com/${RELEASES_REPO}/releases/tag/${TAG}"
+echo "    Appcast:  https://$(echo "$RELEASES_REPO" | cut -d/ -f1).github.io/$(echo "$RELEASES_REPO" | cut -d/ -f2)/appcast.xml"
+echo "    Notes:    https://$(echo "$RELEASES_REPO" | cut -d/ -f1).github.io/$(echo "$RELEASES_REPO" | cut -d/ -f2)/notes/${TAG}.html"

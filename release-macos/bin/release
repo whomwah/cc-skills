@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Build, sign, and optionally notarize a macOS release DMG.
+#
+# Required env:
+#   SIGN_IDENTITY        — e.g. "Developer ID Application: Your Name (TEAM_ID)"
+#
+# App-specific env (override defaults for other apps):
+#   APP_NAME             — app name used for scheme, bundle, and DMG (default: "Oi")
+#   SCHEME               — Xcode scheme to archive (default: APP_NAME)
+#   EXPORT_OPTIONS_PLIST — path to ExportOptions.plist (default: "ExportOptions.plist")
+#   DMG_ASSETS_DIR       — directory containing DMG background images (default: "dmg")
+#   DMG_BG               — background image filename inside DMG_ASSETS_DIR (default: "dmg-background.png")
+#   DMG_BG_2X            — @2x background image filename (default: "dmg-background@2x.png")
+#   VERSION              — marketing version string (default: auto-detected from project.yml)
+#
+# Optional env (all three required to notarize):
+#   NOTARIZATION_KEY_PATH — path to .p8 API key file (auto-detected if AuthKey_*.p8 exists in cwd)
+#   NOTARIZATION_KEY_ID   — App Store Connect API key ID
+#   NOTARIZATION_ISSUER   — App Store Connect issuer UUID
+
+set -euo pipefail
+
+SIGN_IDENTITY="${SIGN_IDENTITY:?SIGN_IDENTITY must be set}"
+
+APP_NAME="${1:-${APP_NAME:-}}"
+: "${APP_NAME:?Usage: bin/release <app-name>  (or set APP_NAME env var)}"
+SCHEME="${SCHEME:-$APP_NAME}"
+EXPORT_OPTIONS_PLIST="${EXPORT_OPTIONS_PLIST:-ExportOptions.plist}"
+DMG_ASSETS_DIR="${DMG_ASSETS_DIR:-dmg}"
+DMG_BG="${DMG_BG:-dmg-background.png}"
+DMG_BG_2X="${DMG_BG_2X:-dmg-background@2x.png}"
+
+# --- Preflight ---
+echo "==> Preflight checks..."
+for tool in xcodebuild codesign hdiutil osascript xcrun spctl; do
+    command -v "$tool" &>/dev/null || { echo "ERROR: $tool not found"; exit 1; }
+done
+
+[ -f "$EXPORT_OPTIONS_PLIST" ] || { echo "ERROR: $EXPORT_OPTIONS_PLIST not found"; exit 1; }
+[ -d "$DMG_ASSETS_DIR" ]      || { echo "ERROR: $DMG_ASSETS_DIR/ assets directory not found"; exit 1; }
+
+# Auto-detect .p8 key if not explicitly set
+if [ -z "${NOTARIZATION_KEY_PATH:-}" ]; then
+    detected=$(echo AuthKey_*.p8)
+    if [ -f "$detected" ]; then
+        NOTARIZATION_KEY_PATH="$detected"
+        echo "    Detected key: $NOTARIZATION_KEY_PATH"
+    fi
+fi
+
+if ! security find-identity -v -p codesigning | grep -qF "$SIGN_IDENTITY"; then
+    echo "ERROR: signing identity not found in keychain: $SIGN_IDENTITY"
+    echo "Available identities:"
+    security find-identity -v -p codesigning
+    exit 1
+fi
+
+build_dir="build/release"
+if [ -z "${VERSION:-}" ]; then
+    [ -f "project.yml" ] || { echo "ERROR: project.yml not found and VERSION not set"; exit 1; }
+    VERSION=$(grep '^\s*MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}' | tr -d '"')
+fi
+version="$VERSION"
+dmg_path="build/${APP_NAME}-${version}.dmg"
+tmp_dmg="build/${APP_NAME}-tmp.dmg"
+
+archive_path="build/${APP_NAME}.xcarchive"
+export_path="build/export"
+
+rm -rf "$build_dir" "$dmg_path" "$tmp_dmg" "$archive_path" "$export_path"
+mkdir -p "$build_dir"
+
+echo "==> Archiving release (${version})..."
+xcodebuild archive \
+    -scheme "$SCHEME" \
+    -configuration Release \
+    -destination "platform=macOS" \
+    -archivePath "$archive_path" \
+    -derivedDataPath build/derived \
+    -quiet
+
+echo "==> Exporting (signing)..."
+xcodebuild -exportArchive \
+    -archivePath "$archive_path" \
+    -exportPath "$export_path" \
+    -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
+    -allowProvisioningUpdates \
+    -quiet
+
+app_path="$export_path/${APP_NAME}.app"
+[ -d "$app_path" ] || { echo "ERROR: ${APP_NAME}.app not found after export"; exit 1; }
+
+echo "==> Verifying signature..."
+codesign --verify --deep --strict "$app_path"
+
+cp -R "$app_path" "$build_dir/${APP_NAME}.app"
+ln -s /Applications "$build_dir/Applications"
+
+echo "==> Creating DMG..."
+hdiutil create -volname "$APP_NAME" -srcfolder "$build_dir" -ov -format UDRW -fs HFS+ "$tmp_dmg" -quiet
+
+DEV=$(hdiutil attach -readwrite -noverify -nobrowse "$tmp_dmg" | grep '/Volumes/' | awk '{print $1}')
+mkdir -p "/Volumes/${APP_NAME}/.background"
+cp "${DMG_ASSETS_DIR}/${DMG_BG}"    "/Volumes/${APP_NAME}/.background/background.png"
+cp "${DMG_ASSETS_DIR}/${DMG_BG_2X}" "/Volumes/${APP_NAME}/.background/background@2x.png"
+osascript \
+    -e 'tell application "Finder"' \
+    -e "  tell disk \"${APP_NAME}\"" \
+    -e '    open' \
+    -e '    set current view of container window to icon view' \
+    -e '    set toolbar visible of container window to false' \
+    -e '    set statusbar visible of container window to false' \
+    -e '    set bounds of container window to {200, 200, 860, 600}' \
+    -e '    set opts to icon view options of container window' \
+    -e '    set icon size of opts to 128' \
+    -e '    set arrangement of opts to not arranged' \
+    -e '    set background picture of opts to file ".background:background.png"' \
+    -e "    set position of item \"${APP_NAME}.app\" of container window to {150, 170}" \
+    -e '    set position of item "Applications" of container window to {510, 170}' \
+    -e '    close' \
+    -e '  end tell' \
+    -e 'end tell'
+sync
+hdiutil detach "$DEV" -quiet
+
+hdiutil convert "$tmp_dmg" -format UDZO -o "$dmg_path" -quiet
+rm -f "$tmp_dmg"
+
+echo "==> Signing DMG..."
+codesign --force --timestamp --sign "$SIGN_IDENTITY" "$dmg_path"
+
+if [ -n "${NOTARIZATION_KEY_PATH:-}" ] && [ -n "${NOTARIZATION_KEY_ID:-}" ] && [ -n "${NOTARIZATION_ISSUER:-}" ]; then
+    echo "==> Notarizing..."
+    RESULT=$(xcrun notarytool submit "$dmg_path" \
+        --key "$NOTARIZATION_KEY_PATH" \
+        --key-id "$NOTARIZATION_KEY_ID" \
+        --issuer "$NOTARIZATION_ISSUER" \
+        --wait --output-format json)
+    echo "$RESULT"
+    STATUS=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+    ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+    if [ "$STATUS" != "Accepted" ]; then
+        echo "Notarization failed — fetching log..."
+        xcrun notarytool log "$ID" \
+            --key "$NOTARIZATION_KEY_PATH" \
+            --key-id "$NOTARIZATION_KEY_ID" \
+            --issuer "$NOTARIZATION_ISSUER"
+        exit 1
+    fi
+    echo "==> Stapling..."
+    xcrun stapler staple "$dmg_path"
+    echo "==> Verifying Gatekeeper assessment..."
+    if ! spctl --assess --type open --context context:primary-signature --verbose "$dmg_path" 2>&1; then
+        echo "WARNING: Gatekeeper rejected DMG after stapling — check notarization log above"
+    fi
+else
+    echo "==> Skipping notarization (set NOTARIZATION_KEY_PATH, NOTARIZATION_KEY_ID, NOTARIZATION_ISSUER to notarize)"
+fi
+
+echo "==> Done: $dmg_path"
