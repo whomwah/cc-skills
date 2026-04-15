@@ -34,7 +34,7 @@ Skip if already on a suitable branch.
 
 ### 3. Implement
 
-Follow @karparthy.md guidelines throughout.
+Consult `references/karparthy.md`.
 
 ### 4. Confirm next steps
 
